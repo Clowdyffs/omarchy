@@ -72,10 +72,10 @@ else:
   if config.get('malformed'):
     sys.stdout.buffer.write(b'\\x02\\x00\\x02\\x00')
   else:
-    # LEN is padded to four bytes; DATA carries the nested-attribute flag.
-    prefix = struct.pack('=HHH', 6, 1, len(payload)) + b'\\0\\0'
-    data = struct.pack('=HH', len(payload) + 4, 0x8002) + payload
-    sys.stdout.buffer.write(prefix + data + b'\\0' * (-len(data) % 4))
+    # Match brcmfmac: DATA then LEN, plain types, both aligned to four bytes.
+    data = struct.pack('=HH', len(payload) + 4, 2) + payload
+    size = struct.pack('=HHH', 6, 1, len(payload)) + b'\\0\\0'
+    sys.stdout.buffer.write(data + b'\\0' * (-len(data) % 4) + size)
 ''')
   iw.chmod(0o755)
   defaults = {'mode': 5, 'frequency': 2437,
@@ -85,7 +85,8 @@ else:
   def reset(**changes):
     state.unlink(missing_ok=True)
     (root / 'calls').write_text('')
-    configure(**(defaults | changes))
+    (device.parent / 'ifindex').write_text('7\n')
+    (root / 'config').write_text(json.dumps(defaults | changes))
 
   def configure(**changes):
     config = json.loads((root / 'config').read_text()) if (root / 'config').exists() else {}
@@ -132,6 +133,48 @@ else:
   assert invoke() == 4 and not state.exists()
   print('ok - network events reapply the quirk; independent policies are never adopted or restored')
 
+  # A removed device can miss its down event or fail the firmware query before
+  # cleanup. Re-registration reuses the name, but has a different ifindex.
+  for failure in ['missing-device', 'firmware-error', 'missed-down']:
+    reset()
+    invoke()
+    if failure == 'missing-device':
+      (device.parent / 'ifindex').unlink()
+      invoke('down')
+    elif failure == 'firmware-error':
+      configure(fail=True)
+      invoke('down')
+      configure(fail=False)
+    (device.parent / 'ifindex').write_text('8\n')
+    # Another writer chose 4 after the firmware restarted at 5. The old marker
+    # must not turn that choice into permission to restore our previous 5.
+    configure(mode=4, frequency=5180)
+    assert invoke() == 4 and writes() == ['btc_mode=4'] and not state.exists()
+  reset()
+  invoke()
+  (device.parent / 'ifindex').write_text('8\n')
+  configure(mode=4)
+  invoke()
+  configure(frequency=5180)
+  assert invoke() == 4 and writes() == ['btc_mode=4']
+  print('ok - ownership never crosses a re-probe, including a missed or failed down event')
+
+  reset()
+  invoke()
+  (device.parent / 'ifindex').write_text('8\n')
+  configure(mode=5)
+  assert invoke() == 4
+  configure(frequency=5180)
+  assert invoke() == 5 and writes() == ['btc_mode=4', 'btc_mode=4', 'btc_mode=5']
+  reset(mode=4, frequency=5180)
+  state.touch()  # Marker from the previous dispatcher version has no identity.
+  assert invoke() == 4 and not writes() and not state.exists()
+  reset()
+  invoke()
+  configure(mode=2, frequency=None)
+  assert invoke('down') == 2 and writes() == ['btc_mode=4'] and not state.exists()
+  print('ok - a fresh default can be owned; legacy markers and different policies cannot be restored')
+
   for name, value in [('vendor', '0x8086'), ('device', '0x43ba'), ('revision', '0x06')]:
     original = (device / name).read_text()
     (device / name).write_text(value)
@@ -166,6 +209,23 @@ else:
     invoke(action, iface)
     assert not (root / 'calls').read_text()
   print('ok - changed firmware, 5 GHz, unrelated events, and invalid interfaces are left alone')
+
+  reset()
+  # Virtual interfaces on this Mac have ifindex but no PCI vendor attribute.
+  (device / 'vendor').unlink()
+  result = subprocess.run([str(dispatcher), 'wlan0', 'up'], capture_output=True, text=True)
+  assert result.returncode == 0 and not result.stderr and not (root / 'calls').read_text()
+  (device / 'vendor').write_text('0x14e4')
+  # Irrelevant NM events must exit before launching the Python interpreter.
+  decoy = root / 'python-decoy'
+  decoy.write_text('#!/bin/bash\nexit 99\n')
+  decoy.chmod(0o755)
+  fast_gate = root / 'fast-gate'
+  fast_gate.write_text(script.replace('/usr/bin/python3', str(decoy)))
+  fast_gate.chmod(0o755)
+  for action in ['vpn-up', 'dns-change', 'connectivity-change']:
+    assert subprocess.run([str(fast_gate), 'wlan0', action]).returncode == 0
+  print('ok - virtual interfaces are quiet and unrelated events skip the interpreter')
 
   for failure in ['fail', 'malformed', 'ignore_write']:
     reset(**{failure: True})
