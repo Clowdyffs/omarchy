@@ -12,7 +12,8 @@ mkdir -p "$test_tmp/bin" "$test_tmp/dmi"
 
 regdom="$test_tmp/etc/conf.d/wireless-regdom"
 modprobe_dir="$test_tmp/etc/modprobe.d"
-conf="$modprobe_dir/omarchy-brcmfmac-regdom.conf"
+conf="$modprobe_dir/00-omarchy-brcmfmac-regdom.conf"
+legacy_conf="$modprobe_dir/omarchy-brcmfmac-regdom.conf"
 export TEST_MODPROBE_DIR="$modprobe_dir"
 export TEST_REAL_MODPROBE
 TEST_REAL_MODPROBE=$(command -v modprobe)
@@ -22,8 +23,8 @@ cat >"$test_tmp/bin/lspci" <<'SH'
 if [[ -n ${TEST_WIFI_ID:-} ]]; then
   printf '02:00.0 Network controller [0280]: Broadcom Wireless [%s]\n' "$TEST_WIFI_ID"
 fi
-# Keep producing output after a match to expose grep -q/SIGPIPE failures when
-# hardware setup is invoked with pipefail enabled.
+# Provide realistic trailing PCI output. run_logged starts bash -eE, so its
+# caller's pipefail does not by itself exercise SIGPIPE handling in the leaf.
 for _ in {1..4096}; do
   echo '00:00.0 Host bridge [0600]: Filler [ffff:0000]'
 done
@@ -74,6 +75,11 @@ run_setup() {
     ' bash "$ROOT" "$test_tmp" >/dev/null
 }
 
+run_leaf() {
+  PATH="$test_tmp/bin:$PATH" TEST_WIFI_ID="${1-14e4:43a3}" \
+    bash -euo pipefail -c 'source "$1"' bash "$test_tmp/fix-regdom.sh" >/dev/null
+}
+
 assert_country() {
   local expected="$1"
   [[ $(bash -c 'source "$1"; printf "%s" "${WIRELESS_REGDOM:-}"' bash "$regdom") == "$expected" ]] ||
@@ -84,7 +90,8 @@ assert_country() {
 
 all="$ROOT/install/hardware/all.sh"
 country_line=$(grep -n 'run_logged .*hardware/set-wireless-regdom.sh' "$all" | cut -d: -f1)
-quirk_line=$(grep -n 'run_logged .*hardware/apple/fix-brcmfmac-regdom.sh' "$all" | cut -d: -f1)
+quirk_line=$(grep -n 'run_logged .*hardware/apple/fix-brcmfmac-regdom.sh' "$all" | cut -d: -f1 || true)
+[[ -n $quirk_line ]] || fail "Apple boot quirk is included in hardware setup"
 (( country_line < quirk_line )) || fail "country selection precedes the Apple boot quirk"
 pass "country selection precedes the Apple boot quirk"
 
@@ -102,6 +109,90 @@ run_setup
 cmp -s "$conf" "$test_tmp/expected.conf" || fail "reruns preserve the module configuration"
 cmp -s "$regdom" "$test_tmp/expected-regdom" || fail "reruns do not duplicate the country setting"
 pass "rerunning hardware setup is idempotent"
+
+printf 'WIRELESS_REGDOM="GB"\n' >"$regdom"
+run_setup
+assert_country GB
+pass "rerunning hardware setup updates its owned country after the saved choice changes"
+
+for country in '' 00 invalid; do
+  reset_fixture
+  run_setup
+  printf 'WIRELESS_REGDOM="%s"\n' "$country" >"$regdom"
+  run_leaf
+  [[ ! -e $conf ]] || fail "clearing or invalidating the country retires the owned file" "$country"
+done
+reset_fixture
+run_setup
+rm "$regdom"
+run_leaf
+[[ ! -e $conf ]] || fail "removing the country configuration retires the owned file"
+pass "unset, invalid, and missing country selections remove only the owned boot hint"
+
+reset_fixture
+run_setup
+printf 'options cfg80211 ieee80211_regdom=GB\n' >"$modprobe_dir/cfg80211.conf"
+options=$("$TEST_REAL_MODPROBE" -C "$modprobe_dir" --showconfig | grep '^options cfg80211 ')
+[[ $options == $'options cfg80211 ieee80211_regdom=US\noptions cfg80211 ieee80211_regdom=GB' ]] ||
+  fail "the generated drop-in sorts before a later administrator country" "$options"
+cp "$modprobe_dir/cfg80211.conf" "$test_tmp/expected-admin.conf"
+run_setup
+[[ ! -e $conf ]] || fail "an administrator country retires the owned hint on rerun"
+cmp -s "$modprobe_dir/cfg80211.conf" "$test_tmp/expected-admin.conf" || fail "administrator file is unchanged"
+pass "later administrator options win in the real modprobe parser and remain untouched on rerun"
+
+reset_fixture
+run_setup
+printf 'options cfg80211 ieee80211_regdom=US\n' >"$modprobe_dir/cfg80211.conf"
+run_setup
+[[ ! -e $conf ]] || fail "an identical independent country must still count as an override"
+grep -qx 'options cfg80211 ieee80211_regdom=US' "$modprobe_dir/cfg80211.conf" || fail "identical administrator country is preserved"
+pass "an administrator's identical country option is not mistaken for our owned entry"
+
+reset_fixture
+run_setup
+mv "$conf" "$legacy_conf"
+printf 'WIRELESS_REGDOM="GB"\n' >"$regdom"
+run_setup
+assert_country GB
+[[ ! -e $legacy_conf ]] || fail "the legacy late-sorting generated file is retired"
+pass "an unedited legacy generated file is migrated and its country updated"
+
+reset_fixture
+run_setup
+cp "$conf" "$legacy_conf"
+printf 'WIRELESS_REGDOM="GB"\n' >"$regdom"
+run_setup
+assert_country GB
+[[ ! -e $legacy_conf ]] || fail "coexisting generated files are consolidated"
+pass "both generated filenames can coexist without being mistaken for administrator overrides"
+
+reset_fixture
+run_setup
+mv "$conf" "$legacy_conf"
+printf 'options cfg80211 ieee80211_regdom=JP\n' >"$modprobe_dir/cfg80211.conf"
+run_setup
+[[ ! -e $conf && ! -e $legacy_conf ]] || fail "a legacy generated file cannot continue overriding administrator settings"
+grep -qx 'options cfg80211 ieee80211_regdom=JP' "$modprobe_dir/cfg80211.conf" || fail "administrator country survives legacy cleanup"
+pass "legacy cleanup also respects a subsequently added administrator override"
+
+for target in "$conf" "$legacy_conf"; do
+  reset_fixture
+  mkdir -p "$modprobe_dir"
+  printf '# Administrator configuration\noptions cfg80211 cfg80211_disable_40mhz_24ghz=1\n' >"$target"
+  cp "$target" "$test_tmp/expected-admin.conf"
+  run_setup
+  cmp -s "$target" "$test_tmp/expected-admin.conf" || fail "edited configuration is not replaced" "$target"
+  printf 'WIRELESS_REGDOM=""\n' >"$regdom"
+  run_leaf
+  cmp -s "$target" "$test_tmp/expected-admin.conf" || fail "edited configuration is not removed" "$target"
+done
+reset_fixture
+mkdir -p "$modprobe_dir"
+ln -s /dev/null "$conf"
+run_setup
+[[ -L $conf && $(readlink "$conf") == /dev/null ]] || fail "administrator mask is preserved"
+pass "edited files and an administrator mask are preserved when updating or clearing the country"
 
 for zone_country in Europe/London:GB Asia/Tokyo:JP; do
   reset_fixture "Apple Inc." "${zone_country%:*}"
