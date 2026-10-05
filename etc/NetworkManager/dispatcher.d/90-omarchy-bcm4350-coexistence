@@ -92,6 +92,9 @@ def apply(iface):
     state.write_text(ifindex + '\n')
     iovar(iface, 'btc_mode', 4)
     if mode(iface) != 4:
+      # A definite nonparallel readback is not an override we own. Exceptions
+      # leave the marker intact because the write's outcome is still unknown.
+      state.unlink()
       raise ValueError('parallel policy readback failed')
     print('BCM4350: enabled parallel coexistence on 2.4 GHz', file=sys.stderr)
   elif not on_2ghz and state.exists():

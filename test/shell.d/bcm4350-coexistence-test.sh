@@ -65,9 +65,15 @@ else:
     assert mode in (4, 5)
     if not config.get('ignore_write'):
       config['mode'] = mode
+      if config.get('lose_write_ack') or config.get('lose_readback'):
+        config['fail_mode_read'] = True
       (root / 'config').write_text(json.dumps(config))
+    if config.get('lose_write_ack'):
+      sys.exit(1)
     sys.exit(0)
   assert value == b'' and name in (b'ver', b'btc_mode')
+  if name == b'btc_mode' and config.get('fail_mode_read'):
+    sys.exit(1)
   payload = config['version'].encode() + b'\\0' if name == b'ver' else struct.pack('<I', config['mode'])
   if config.get('malformed'):
     sys.stdout.buffer.write(b'\\x02\\x00\\x02\\x00')
@@ -231,10 +237,31 @@ else:
     reset(**{failure: True})
     assert invoke() == 5
     assert writes() == (['btc_mode=4'] if failure == 'ignore_write' else [])
-    # A lost acknowledgement remains recoverable at the next network event.
     if failure == 'ignore_write':
-      assert state.exists()
+      assert not state.exists(), 'confirmed failed write must not retain ownership'
     configure(**{failure: False})
+  reset(ignore_write=True)
+  assert invoke() == 5 and not state.exists()
+  # Another tool chooses 4 on the same interface after our confirmed failure.
+  configure(ignore_write=False, mode=4, frequency=5180)
+  assert invoke() == 4 and writes() == ['btc_mode=4'] and not state.exists()
+  reset(ignore_write=True)
+  invoke()
+  configure(ignore_write=False)
+  assert invoke('reapply') == 4 and state.exists()
+  configure(frequency=5180)
+  assert invoke() == 5 and not state.exists()
+  print('ok - a confirmed failed write releases ownership without adopting another writer; retry can succeed')
+
+  for failure in ['lose_write_ack', 'lose_readback']:
+    reset(**{failure: True})
+    assert invoke() == 4 and state.exists()
+    configure(**{failure: False})
+    assert invoke('reapply') == 4 and state.exists() and writes() == ['btc_mode=4']
+    configure(fail_mode_read=False, frequency=5180)
+    assert invoke() == 5 and not state.exists() and writes() == ['btc_mode=4', 'btc_mode=5']
+  print('ok - a lost write acknowledgement or unavailable readback retains ownership for recovery')
+
   reset()
   invoke()
   configure(frequency=5180, ignore_write=True)
